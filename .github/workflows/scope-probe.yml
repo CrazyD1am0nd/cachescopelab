@@ -1,0 +1,31 @@
+name: scope-probe
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show cache service env + decoded runtime token claims
+        run: |
+          echo "event=${{ github.event_name }}  ref=${{ github.ref }}"
+          echo "ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:-unset}"
+          echo "ACTIONS_CACHE_URL=${ACTIONS_CACHE_URL:-unset}"
+          echo "ACTIONS_CACHE_SERVICE_V2=${ACTIONS_CACHE_SERVICE_V2:-unset}"
+          python3 - <<'PY'
+          import os, base64, json
+          t = os.environ.get("ACTIONS_RUNTIME_TOKEN","")
+          if not t:
+              print("NO ACTIONS_RUNTIME_TOKEN"); raise SystemExit
+          p = t.split(".")
+          print("jwt segments:", len(p))
+          body = p[1] + "=" * (-len(p[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(body))
+          for k, v in sorted(claims.items()):
+              s = json.dumps(v) if not isinstance(v, str) else v
+              print(f"  {k} = {s[:400]}")
+          PY
+        env:
+          ACTIONS_RUNTIME_TOKEN: ${{ secrets.GITHUB_TOKEN && '' || '' }}
